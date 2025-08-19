@@ -38,7 +38,7 @@ import (
 	// PostgreSQL database
 	"strconv"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 // PostgreSQL driver
@@ -48,6 +48,15 @@ func main() {
 
 	// Version
 	const Version = "1.0.1"
+
+	// Variables for PostgreSQL
+	var (
+		columns []string
+		schema  []string
+		indexes []string
+		txn     *sql.Tx
+		stmt    *sql.Stmt
+	)
 
 	// Set default chainstate LevelDB and output file
 	defaultfolder := fmt.Sprintf("%s/.bitcoin/chainstate/", os.Getenv("HOME")) // %s = string
@@ -121,6 +130,22 @@ func main() {
 			return
 		}
 
+		// Tune PostgreSQL parameters for bulk loading
+		tuningParams := []string{
+			"SET maintenance_work_mem = '1GB'",
+			"SET synchronous_commit = OFF",
+			"SET work_mem = '64MB'",
+			"SET temp_buffers = '128MB'",
+			"SET commit_delay = 10000",
+		}
+
+		for _, param := range tuningParams {
+			if _, err = pgdb.Exec(param); err != nil {
+				fmt.Printf("Error setting PostgreSQL parameter: %v\n", err)
+				return
+			}
+		}
+
 		// Check if the utxos table exists
 		var tableExists bool
 		err = pgdb.QueryRow("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'utxos')").Scan(&tableExists)
@@ -152,8 +177,8 @@ func main() {
 		}
 
 		// Build dynamic table schema based on selected fields
-		schema := []string{}
-		indexes := []string{}
+		schema = make([]string, 0)
+		indexes = make([]string, 0)
 
 		// Add fields based on selection
 		if fieldsSelected["txid"] {
@@ -318,7 +343,6 @@ func main() {
 
 	var f *os.File
 	var writer *bufio.Writer
-	var insertStmt *sql.Stmt
 
 	if *pgURI != "" {
 		// Using PostgreSQL output
@@ -355,7 +379,7 @@ func main() {
 
 	if *pgURI != "" {
 		// Build dynamic INSERT statement based on selected fields
-		columns := []string{}
+		columns = make([]string, 0)
 		placeholders := []string{}
 		paramCount := 0
 
@@ -406,22 +430,12 @@ func main() {
 			placeholders = append(placeholders, fmt.Sprintf("$%d", paramCount))
 		}
 
-		insertQuery := fmt.Sprintf("INSERT INTO utxos (%s) VALUES (%s)",
-			strings.Join(columns, ", "),
-			strings.Join(placeholders, ", "))
-
-		// Start initial transaction
-		if _, err = pgdb.Exec("BEGIN"); err != nil {
-			fmt.Printf("Error starting transaction: %v\n", err)
+		// Create temporary table with the same schema as the main table
+		tempTableQuery := fmt.Sprintf("CREATE TEMP TABLE temp_utxos (LIKE utxos INCLUDING DEFAULTS)")
+		if _, err = pgdb.Exec(tempTableQuery); err != nil {
+			fmt.Printf("Error creating temporary table: %v\n", err)
 			return
 		}
-
-		insertStmt, err = pgdb.Prepare(insertQuery)
-		if err != nil {
-			fmt.Printf("Error preparing insert statement: %v\n", err)
-			return
-		}
-		defer insertStmt.Close()
 
 		if !*quiet {
 			fmt.Printf("Processing %s and writing results to PostgreSQL\n", *chainstate)
@@ -902,22 +916,42 @@ func main() {
 					args = append(args, addressVal)
 				}
 
-				// Execute the insert for the current record
-				_, err = insertStmt.Exec(args...)
+				// Execute COPY for the current record
+				if stmt == nil || txn == nil {
+					// Start new transaction and prepare new COPY statement if not exists
+					txn, err = pgdb.Begin()
+					if err != nil {
+						fmt.Printf("Error starting transaction: %v\n", err)
+						return
+					}
+					stmt, err = txn.Prepare(pq.CopyIn("temp_utxos", columns...))
+					if err != nil {
+						fmt.Printf("Error preparing COPY statement: %v\n", err)
+						return
+					}
+				}
+
+				_, err = stmt.Exec(args...)
 				if err != nil {
-					fmt.Printf("Error inserting record: %v\n", err)
+					fmt.Printf("Error copying record: %v\n", err)
 					return
 				}
 
-				// Commit batch when we reach 1000 records and start a new transaction
-				if (i+1)%1000 == 0 {
-					if _, err = pgdb.Exec("COMMIT"); err != nil {
-						fmt.Printf("Error committing transaction: %v\n", err)
-						return
+				// Flush batch when we reach 10000 records
+				if (i+1)%10000 == 0 {
+					if stmt != nil {
+						if err = stmt.Close(); err != nil {
+							fmt.Printf("Error closing statement: %v\n", err)
+							return
+						}
+						stmt = nil
 					}
-					if _, err = pgdb.Exec("BEGIN"); err != nil {
-						fmt.Printf("Error starting new transaction: %v\n", err)
-						return
+					if txn != nil {
+						if err = txn.Commit(); err != nil {
+							fmt.Printf("Error committing transaction: %v\n", err)
+							return
+						}
+						txn = nil
 					}
 				}
 			}
@@ -928,11 +962,37 @@ func main() {
 	}
 	iter.Release() // Do not defer this, want to release iterator before closing database
 
-	// Commit any remaining records in PostgreSQL
+	// Commit any remaining records and move data from temp table to final table
 	if *pgURI != "" {
-		if _, err = pgdb.Exec("COMMIT"); err != nil {
-			fmt.Printf("Error committing final transaction: %v\n", err)
+		// Close and commit the final COPY transaction
+		if stmt != nil {
+			if err = stmt.Close(); err != nil {
+				fmt.Printf("Error closing final statement: %v\n", err)
+				return
+			}
+		}
+		if txn != nil {
+			if err = txn.Commit(); err != nil {
+				fmt.Printf("Error committing final transaction: %v\n", err)
+				return
+			}
+		}
+
+		// Move data from temp table to final table
+		if _, err = pgdb.Exec("INSERT INTO utxos SELECT * FROM temp_utxos"); err != nil {
+			fmt.Printf("Error moving data to final table: %v\n", err)
 			return
+		}
+
+		// Create indexes after data is loaded
+		if !*quiet {
+			fmt.Println("Creating indexes...")
+		}
+		for _, indexSQL := range indexes {
+			if _, err = pgdb.Exec(indexSQL); err != nil {
+				fmt.Printf("Error creating index: %v\n", err)
+				return
+			}
 		}
 	}
 
