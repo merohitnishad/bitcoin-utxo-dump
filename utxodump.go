@@ -38,11 +38,56 @@ import (
 	// PostgreSQL database
 	"strconv"
 
-	"github.com/lib/pq"
+	"github.com/lib/pq" // PostgreSQL driver
 )
 
 // PostgreSQL driver
 // String conversion functions
+
+// executeBatch executes a batch of records using PostgreSQL COPY
+func executeBatch(db *sql.DB, txn **sql.Tx, stmt **sql.Stmt, columns []string, batch [][]interface{}, verbose bool) error {
+	var err error
+
+	// Start transaction if not exists
+	if *txn == nil {
+		*txn, err = db.Begin()
+		if err != nil {
+			return fmt.Errorf("error starting transaction: %v", err)
+		}
+	}
+
+	// Prepare COPY statement if not exists
+	if *stmt == nil {
+		*stmt, err = (*txn).Prepare(pq.CopyIn("utxos", columns...))
+		if err != nil {
+			return fmt.Errorf("error preparing COPY statement: %v", err)
+		}
+	}
+
+	// Execute batch
+	for _, args := range batch {
+		_, err = (*stmt).Exec(args...)
+		if err != nil {
+			return fmt.Errorf("error copying record: %v", err)
+		}
+	}
+
+	// Flush the batch
+	err = (*stmt).Close()
+	if err != nil {
+		return fmt.Errorf("error closing statement: %v", err)
+	}
+	*stmt = nil
+
+	// Commit transaction
+	err = (*txn).Commit()
+	if err != nil {
+		return fmt.Errorf("error committing transaction: %v", err)
+	}
+	*txn = nil
+
+	return nil
+}
 
 func main() {
 
@@ -56,7 +101,9 @@ func main() {
 		indexes []string
 		txn     *sql.Tx
 		stmt    *sql.Stmt
+		batch   [][]interface{}
 	)
+	const batchSize = 10000
 
 	// Set default chainstate LevelDB and output file
 	defaultfolder := fmt.Sprintf("%s/.bitcoin/chainstate/", os.Getenv("HOME")) // %s = string
@@ -430,11 +477,22 @@ func main() {
 			placeholders = append(placeholders, fmt.Sprintf("$%d", paramCount))
 		}
 
-		// Create temporary table with the same schema as the main table
-		tempTableQuery := fmt.Sprintf("CREATE TEMP TABLE temp_utxos (LIKE utxos INCLUDING DEFAULTS)")
-		if _, err = pgdb.Exec(tempTableQuery); err != nil {
-			fmt.Printf("Error creating temporary table: %v\n", err)
+		// Drop existing table if it exists
+		_, err = pgdb.Exec("DROP TABLE IF EXISTS utxos")
+		if err != nil {
+			fmt.Printf("Error dropping existing table: %v\n", err)
 			return
+		}
+
+		// Create table with the specified schema
+		createTableSQL := fmt.Sprintf("CREATE TABLE utxos (\n    %s\n);", strings.Join(schema, ",\n    "))
+		if _, err = pgdb.Exec(createTableSQL); err != nil {
+			fmt.Printf("Error creating table: %v\n", err)
+			return
+		}
+
+		if !*quiet {
+			fmt.Println("Created table utxos")
 		}
 
 		if !*quiet {
@@ -838,122 +896,42 @@ func main() {
 				// Write to CSV file
 				fmt.Fprintln(writer, csvline)
 			} else {
-				// Write to PostgreSQL
-				args := []interface{}{}
+				// Write to PostgreSQL using COPY
+				args := make([]interface{}, 0)
 
-				// Add fields in the same order as in the INSERT statement
-				if fieldsSelected["txid"] {
-					args = append(args, sql.NullString{String: output["txid"], Valid: output["txid"] != ""})
-				}
-
-				if fieldsSelected["vout"] {
-					voutVal := sql.NullInt64{}
-					if val, ok := output["vout"]; ok {
-						if v, err := strconv.ParseInt(val, 10, 64); err == nil {
-							voutVal.Int64 = v
-							voutVal.Valid = true
-						}
-					}
-					args = append(args, voutVal)
-				}
-
-				if fieldsSelected["height"] {
-					heightVal := sql.NullInt64{}
-					if val, ok := output["height"]; ok {
-						if h, err := strconv.ParseInt(val, 10, 64); err == nil {
-							heightVal.Int64 = h
-							heightVal.Valid = true
-						}
-					}
-					args = append(args, heightVal)
-				}
-
+				// Build args array in the same order as columns
 				if fieldsSelected["amount"] {
-					amountVal := sql.NullInt64{}
 					if val, ok := output["amount"]; ok {
 						if a, err := strconv.ParseInt(val, 10, 64); err == nil {
-							amountVal.Int64 = a
-							amountVal.Valid = true
+							args = append(args, a)
+						} else {
+							args = append(args, nil)
 						}
+					} else {
+						args = append(args, nil)
 					}
-					args = append(args, amountVal)
-				}
-
-				if fieldsSelected["coinbase"] {
-					coinbaseVal := sql.NullBool{}
-					if val, ok := output["coinbase"]; ok {
-						if c, err := strconv.ParseBool(val); err == nil {
-							coinbaseVal.Bool = c
-							coinbaseVal.Valid = true
-						}
-					}
-					args = append(args, coinbaseVal)
-				}
-
-				if fieldsSelected["nsize"] {
-					nsizeVal := sql.NullInt64{}
-					if val, ok := output["nsize"]; ok {
-						if n, err := strconv.ParseInt(val, 10, 64); err == nil {
-							nsizeVal.Int64 = n
-							nsizeVal.Valid = true
-						}
-					}
-					args = append(args, nsizeVal)
-				}
-
-				if fieldsSelected["script"] {
-					scriptVal := sql.NullString{String: output["script"], Valid: output["script"] != ""}
-					args = append(args, scriptVal)
-				}
-
-				if fieldsSelected["type"] {
-					typeVal := sql.NullString{String: output["type"], Valid: output["type"] != ""}
-					args = append(args, typeVal)
 				}
 
 				if fieldsSelected["address"] {
-					addressVal := sql.NullString{String: output["address"], Valid: output["address"] != ""}
-					args = append(args, addressVal)
+					if val, ok := output["address"]; ok && val != "" {
+						args = append(args, val)
+					} else {
+						args = append(args, nil)
+					}
 				}
 
-				// Execute COPY for the current record
-				if stmt == nil || txn == nil {
-					// Start new transaction and prepare new COPY statement if not exists
-					txn, err = pgdb.Begin()
-					if err != nil {
-						fmt.Printf("Error starting transaction: %v\n", err)
+				// Add to batch
+				batch = append(batch, args)
+
+				// Execute batch if we've reached batch size
+				if len(batch) >= batchSize {
+					if err := executeBatch(pgdb, &txn, &stmt, columns, batch, !*quiet); err != nil {
+						fmt.Printf("Error executing batch at record %d: %v\n", i, err)
 						return
 					}
-					stmt, err = txn.Prepare(pq.CopyIn("temp_utxos", columns...))
-					if err != nil {
-						fmt.Printf("Error preparing COPY statement: %v\n", err)
-						return
-					}
+					batch = make([][]interface{}, 0, batchSize)
 				}
 
-				_, err = stmt.Exec(args...)
-				if err != nil {
-					fmt.Printf("Error copying record: %v\n", err)
-					return
-				}
-
-				// Flush batch when we reach 10000 records
-				if (i+1)%10000 == 0 {
-					if stmt != nil {
-						if err = stmt.Close(); err != nil {
-							fmt.Printf("Error closing statement: %v\n", err)
-							return
-						}
-						stmt = nil
-					}
-					if txn != nil {
-						if err = txn.Commit(); err != nil {
-							fmt.Printf("Error committing transaction: %v\n", err)
-							return
-						}
-						txn = nil
-					}
-				}
 			}
 
 			// Increment Count
@@ -962,37 +940,41 @@ func main() {
 	}
 	iter.Release() // Do not defer this, want to release iterator before closing database
 
-	// Commit any remaining records and move data from temp table to final table
-	if *pgURI != "" {
-		// Close and commit the final COPY transaction
-		if stmt != nil {
-			if err = stmt.Close(); err != nil {
-				fmt.Printf("Error closing final statement: %v\n", err)
-				return
-			}
-		}
-		if txn != nil {
-			if err = txn.Commit(); err != nil {
-				fmt.Printf("Error committing final transaction: %v\n", err)
-				return
-			}
-		}
-
-		// Move data from temp table to final table
-		if _, err = pgdb.Exec("INSERT INTO utxos SELECT * FROM temp_utxos"); err != nil {
-			fmt.Printf("Error moving data to final table: %v\n", err)
+	// Execute any remaining batch
+	if *pgURI != "" && len(batch) > 0 {
+		if err := executeBatch(pgdb, &txn, &stmt, columns, batch, !*quiet); err != nil {
+			fmt.Printf("Error executing final batch: %v\n", err)
 			return
 		}
+	}
 
-		// Create indexes after data is loaded
+	// Create indexes after all data is loaded
+	if *pgURI != "" {
+		// Get final count
+		var finalCount int
+		if err = pgdb.QueryRow("SELECT COUNT(*) FROM utxos").Scan(&finalCount); err != nil {
+			fmt.Printf("Error counting records: %v\n", err)
+			return
+		}
 		if !*quiet {
-			fmt.Println("Creating indexes...")
+			fmt.Printf("\nTotal records in database: %d\n", finalCount)
+		}
+
+		// Create indexes
+		if !*quiet {
+			fmt.Println("\nCreating indexes...")
 		}
 		for _, indexSQL := range indexes {
+			if !*quiet {
+				fmt.Printf("Creating index: %s\n", indexSQL)
+			}
 			if _, err = pgdb.Exec(indexSQL); err != nil {
 				fmt.Printf("Error creating index: %v\n", err)
 				return
 			}
+		}
+		if !*quiet {
+			fmt.Println("All indexes created successfully")
 		}
 	}
 
